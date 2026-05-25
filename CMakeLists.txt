@@ -41,6 +41,8 @@ endif()
 
 project(msquic)
 
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
 # Set a default build type if none was specified
 set(default_build_type "Release")
 
@@ -101,7 +103,6 @@ option(QUIC_GAMECORE_BUILD "Build for GameCore" OFF)
 option(QUIC_EXTERNAL_TOOLCHAIN "Enable if system libs and include paths are configured by CMake toolchain" OFF)
 option(QUIC_PGO "Enables profile guided optimizations" OFF)
 option(QUIC_LINUX_IOURING_ENABLED "Enables io_uring support" OFF)
-option(QUIC_LINUX_XDP_ENABLED "Enables XDP support" OFF)
 option(QUIC_SOURCE_LINK "Enables source linking on MSVC" ON)
 option(QUIC_EMBED_GIT_HASH "Embed git commit hash in the binary" ON)
 option(QUIC_PDBALTPATH "Enable PDBALTPATH setting on MSVC" ON)
@@ -114,6 +115,28 @@ option(QUIC_USE_SYSTEM_LIBCRYPTO "Use system libcrypto if quictls TLS" OFF)
 option(QUIC_USE_EXTERNAL_OPENSSL "Use external OpenSSL instead of building from submodules" OFF)
 set(QUIC_OPENSSL_INCLUDE_DIR "" CACHE PATH "Path to OpenSSL include directory")
 set(QUIC_OPENSSL_LIB_DIR "" CACHE PATH "Path to OpenSSL library directory")
+set(QUIC_OPENSSL_SYMBOL_PREFIX "" CACHE STRING "If non-empty, namespace-prefix every symbol in the bundled OpenSSL static archives (Linux only) so the resulting binary can coexist in the same process with another OpenSSL copy. See docs/OpenSSLSymbolPrefix.md")
+set(QUIC_OPENSSL_ROOT_DIR "" CACHE PATH "Path to OpenSSL root directory")
+
+# Outer-most validation for QUIC_OPENSSL_SYMBOL_PREFIX so a value combined with
+# a non-quictls/openssl TLS_LIB (e.g. schannel) errors loudly instead of being
+# silently ignored, and so the prefix value is rejected before it is
+# interpolated into objcopy --redefine-syms map lines or build-tree paths.
+if(NOT "${QUIC_OPENSSL_SYMBOL_PREFIX}" STREQUAL "")
+    if(NOT (QUIC_TLS_LIB STREQUAL "quictls" OR QUIC_TLS_LIB STREQUAL "openssl"))
+        message(FATAL_ERROR
+            "QUIC_OPENSSL_SYMBOL_PREFIX requires QUIC_TLS_LIB=quictls or openssl "
+            "(got QUIC_TLS_LIB='${QUIC_TLS_LIB}'). The prefix only applies to the "
+            "bundled OpenSSL build path.")
+    endif()
+    if(NOT QUIC_OPENSSL_SYMBOL_PREFIX MATCHES "^[A-Za-z_][A-Za-z0-9_]*$")
+        message(FATAL_ERROR
+            "QUIC_OPENSSL_SYMBOL_PREFIX must match ^[A-Za-z_][A-Za-z0-9_]*$ "
+            "(got '${QUIC_OPENSSL_SYMBOL_PREFIX}'). The prefix is interpolated into "
+            "objcopy --redefine-syms map lines and into the build-tree path; "
+            "whitespace, '#', '/', leading digits, and shell metacharacters are unsafe.")
+    endif()
+endif()
 option(QUIC_HIGH_RES_TIMERS "Configure the system to use high resolution timers" OFF)
 option(QUIC_OFFICIAL_RELEASE "Configured the build for an official release" OFF)
 set(QUIC_FOLDER_PREFIX "" CACHE STRING "Optional prefix for source group folders when using an IDE generator")
@@ -322,10 +345,6 @@ else()
         if(QUIC_ENABLE_LOGGING AND QUIC_LOGGING_TYPE STREQUAL "")
             set(QUIC_LOGGING_TYPE "lttng")
             message(STATUS "Choosing lttng as default logging type for platform")
-        endif()
-
-        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|aarch64)$")
-            set(QUIC_LINUX_XDP_ENABLED OFF CACHE BOOL "XDP not supported on ARM architectures" FORCE)
         endif()
 
     elseif(CX_PLATFORM STREQUAL "darwin")
@@ -763,20 +782,25 @@ if(QUIC_TLS_LIB STREQUAL "quictls" OR QUIC_TLS_LIB STREQUAL "openssl")
     add_library(OpenSSL INTERFACE)
 
     # OpenSSL versions before 3.5.0 do not expose these APIs.
-    if(QUIC_TLS_LIB STREQUAL "quictls" AND (QUIC_USE_EXTERNAL_OPENSSL OR QUIC_OPENSSL_INCLUDE_DIR OR QUIC_OPENSSL_LIB_DIR))
+    if(QUIC_TLS_LIB STREQUAL "quictls" AND (QUIC_USE_EXTERNAL_OPENSSL OR QUIC_OPENSSL_INCLUDE_DIR OR QUIC_OPENSSL_LIB_DIR OR QUIC_OPENSSL_ROOT_DIR))
         message(FATAL_ERROR "Manual OpenSSL selection is not supported with the 'quictls'. 'quictls' must be built from submodules to ensure static linkage with required QUIC APIs. Use 'openssl' provider for external 3.5.0+ OpenSSL.")
     endif()
 
     # Only 'openssl' provider supports external selection for now
-    if(QUIC_TLS_LIB STREQUAL "openssl" AND (QUIC_USE_EXTERNAL_OPENSSL OR QUIC_OPENSSL_INCLUDE_DIR OR QUIC_OPENSSL_LIB_DIR))
+    if(QUIC_TLS_LIB STREQUAL "openssl" AND (QUIC_USE_EXTERNAL_OPENSSL OR QUIC_OPENSSL_INCLUDE_DIR OR QUIC_OPENSSL_LIB_DIR OR QUIC_OPENSSL_ROOT_DIR))
         add_library(OpenSSLQuic INTERFACE)
         if(QUIC_OPENSSL_INCLUDE_DIR AND QUIC_OPENSSL_LIB_DIR)
             target_include_directories(OpenSSLQuic INTERFACE ${QUIC_OPENSSL_INCLUDE_DIR})
-            find_library(LIB_CRYPTO NAMES crypto libcrypto PATHS ${QUIC_OPENSSL_LIB_DIR} NO_DEFAULT_PATH)
+            if(BUILD_SHARED_LIBS)
+                find_library(LIB_CRYPTO NAMES crypto libcrypto PATHS ${QUIC_OPENSSL_LIB_DIR} NO_DEFAULT_PATH)
+                find_library(LIB_SSL NAMES ssl libssl PATHS ${QUIC_OPENSSL_LIB_DIR} NO_DEFAULT_PATH)
+            else()
+                find_library(LIB_CRYPTO NAMES "crypto${CMAKE_STATIC_LIBRARY_SUFFIX}" "libcrypto${CMAKE_STATIC_LIBRARY_SUFFIX}" PATHS ${QUIC_OPENSSL_LIB_DIR} NO_DEFAULT_PATH)
+                find_library(LIB_SSL NAMES "ssl${CMAKE_STATIC_LIBRARY_SUFFIX}" "libssl${CMAKE_STATIC_LIBRARY_SUFFIX}" PATHS ${QUIC_OPENSSL_LIB_DIR} NO_DEFAULT_PATH)
+            endif()
             if(NOT LIB_CRYPTO)
                 message(FATAL_ERROR "libcrypto not found in ${QUIC_OPENSSL_LIB_DIR}")
             endif()
-            find_library(LIB_SSL NAMES ssl libssl PATHS ${QUIC_OPENSSL_LIB_DIR} NO_DEFAULT_PATH)
             if(NOT LIB_SSL)
                 message(FATAL_ERROR "libssl not found in ${QUIC_OPENSSL_LIB_DIR}")
             endif()
@@ -784,8 +808,19 @@ if(QUIC_TLS_LIB STREQUAL "quictls" OR QUIC_TLS_LIB STREQUAL "openssl")
         elseif(QUIC_OPENSSL_INCLUDE_DIR OR QUIC_OPENSSL_LIB_DIR)
             message(FATAL_ERROR "Both QUIC_OPENSSL_INCLUDE_DIR and QUIC_OPENSSL_LIB_DIR must be set to select custom OpenSSL version.")
         else()
+            if(QUIC_OPENSSL_ROOT_DIR)
+                set(OPENSSL_ROOT_DIR "${QUIC_OPENSSL_ROOT_DIR}")
+            endif()
+            if(NOT BUILD_SHARED_LIBS)
+                set(OPENSSL_USE_STATIC_LIBS TRUE)
+            endif()
             find_package(OpenSSL 3.5.0 REQUIRED)
-            target_link_libraries(OpenSSLQuic INTERFACE OpenSSL::SSL OpenSSL::Crypto)
+            # OpenSSL::SSL and OpenSSL::Crypto imported targets propagate transitive dependencies
+            # (for example zstd). BUILD_SHARED_LIBS is OFF and those transitive static libs can be linked again via
+            # src/platform/CMakeLists.txt, causing duplicate/static link failures.
+            # Keep link ownership consistent to avoid duplicate transitive linkage.
+            target_include_directories(OpenSSLQuic INTERFACE ${OPENSSL_INCLUDE_DIR})
+            target_link_libraries(OpenSSLQuic INTERFACE ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY})
         endif()
         add_library(MsQuic::OpenSSL ALIAS OpenSSLQuic)
     else()
@@ -799,18 +834,50 @@ if(QUIC_TLS_LIB STREQUAL "quictls" OR QUIC_TLS_LIB STREQUAL "openssl")
         FetchContent_MakeAvailable(OpenSSLQuic)
     endif()
 
-    target_link_libraries(OpenSSL
-        INTERFACE
-        MsQuic::OpenSSL
-    )
+    # Optional: namespace-prefix the bundled OpenSSL symbols so the resulting
+    # binary can coexist with another OpenSSL copy loaded into the same
+    # process. See docs/OpenSSLSymbolPrefix.md for motivation and caveats.
+    if(NOT "${QUIC_OPENSSL_SYMBOL_PREFIX}" STREQUAL "")
+        if(NOT CX_PLATFORM STREQUAL "linux")
+            message(FATAL_ERROR "QUIC_OPENSSL_SYMBOL_PREFIX is only supported on Linux today (got CX_PLATFORM=${CX_PLATFORM}).")
+        endif()
+        if(QUIC_USE_EXTERNAL_OPENSSL OR QUIC_OPENSSL_INCLUDE_DIR OR QUIC_OPENSSL_LIB_DIR OR QUIC_OPENSSL_ROOT_DIR)
+            message(FATAL_ERROR "QUIC_OPENSSL_SYMBOL_PREFIX requires the bundled OpenSSL build; do not combine with QUIC_USE_EXTERNAL_OPENSSL / QUIC_OPENSSL_INCLUDE_DIR / QUIC_OPENSSL_LIB_DIR / QUIC_OPENSSL_ROOT_DIR.")
+        endif()
+        if(QUIC_USE_SYSTEM_LIBCRYPTO)
+            message(FATAL_ERROR "QUIC_OPENSSL_SYMBOL_PREFIX is incompatible with QUIC_USE_SYSTEM_LIBCRYPTO; the system libcrypto cannot be renamed.")
+        endif()
+        # Block the shared-lib install path until the prefixed archives are
+        # wired into install(EXPORT). The prefixed target is INTERFACE IMPORTED
+        # GLOBAL and cannot be installed via install(TARGETS); a shared-lib
+        # install would either fail or produce a package that references
+        # build-tree-only paths under ${CMAKE_BINARY_DIR}/openssl-prefixed/.
+        # Static-lib consumers (the primary use case) are unaffected.
+        if(BUILD_SHARED_LIBS)
+            message(FATAL_ERROR "QUIC_OPENSSL_SYMBOL_PREFIX is currently only supported with BUILD_SHARED_LIBS=OFF (the shared-lib install path does not yet handle the prefixed imported target).")
+        endif()
+
+        include(PrefixOpenSSLArchives)
+        prefix_openssl_archives(
+            PREFIX        "${QUIC_OPENSSL_SYMBOL_PREFIX}"
+            INPUT_TARGET  OpenSSLQuic
+            OUTPUT_TARGET OpenSSLQuicPrefixed
+        )
+
+        target_link_libraries(OpenSSL
+            INTERFACE
+            OpenSSLQuicPrefixed
+        )
+    else()
+        target_link_libraries(OpenSSL
+            INTERFACE
+            MsQuic::OpenSSL
+        )
+    endif()
 endif()
 
 if (QUIC_USE_SYSTEM_LIBCRYPTO)
     list(APPEND QUIC_COMMON_DEFINES CXPLAT_SYSTEM_CRYPTO)
-endif()
-
-if (QUIC_LINUX_XDP_ENABLED)
-    list(APPEND QUIC_COMMON_DEFINES CXPLAT_LINUX_XDP_ENABLED)
 endif()
 
 if (QUIC_LINUX_IOURING_ENABLED)
