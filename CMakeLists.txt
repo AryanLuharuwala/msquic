@@ -82,6 +82,7 @@ else()
 endif()
 
 option(QUIC_BUILD_TOOLS "Builds the tools code" OFF)
+option(QUIC_BUILD_WRAPPER "Builds the optional single-layer convenience wrapper and its loopback example" OFF)
 option(QUIC_BUILD_TEST "Builds the test code" OFF)
 option(QUIC_BUILD_PERF "Builds the perf code" OFF)
 option(QUIC_BUILD_SHARED "Builds msquic as a dynamic library" ON)
@@ -913,6 +914,11 @@ add_subdirectory(src/bin)
 # Tool code
 if(QUIC_BUILD_TOOLS)
     add_subdirectory(src/tools)
+endif()
+
+# Optional single-layer convenience wrapper (off by default; see src/wrapper)
+if(QUIC_BUILD_WRAPPER)
+    add_subdirectory(src/wrapper)
 endif()
 
 # Performance code
