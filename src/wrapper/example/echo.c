@@ -44,6 +44,12 @@ Abstract:
 // echoes each chunk straight back with quic_send(). Runs until the stream/conn
 // closes (quic_recv returns quic_err_closed).
 //
+// Ownership: this worker is the consumer of the listener-accepted quic_conn, so
+// it MUST quic_close(conn) exactly once when its loop ends to release the
+// wrapper-owned handle (see quic.h). quic_close() is safe to call after the
+// peer has already closed the connection, so this is correct even though the
+// loop exits precisely because quic_recv() saw the connection close.
+//
 static void*
 EchoWorker(void* arg)
 {
@@ -60,6 +66,7 @@ EchoWorker(void* arg)
             break;
         }
     }
+    quic_close(conn); // release the accepted connection (ownership contract)
     return NULL;
 }
 

@@ -46,7 +46,6 @@ Abstract:
 #include <deque>
 #include <mutex>
 #include <string>
-#include <vector>
 
 //
 // Global library state, created by quic_init().
@@ -199,17 +198,33 @@ ConnectionCallback(HQUIC Connection, void* Context, QUIC_CONNECTION_EVENT* Event
         c->cv.notify_all();
         break;
     case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
-        {
-            std::lock_guard<std::mutex> lk(c->mtx);
-            c->closed = true;
-        }
-        c->cv.notify_all();
-        if (c->on_closed) {
-            c->on_closed(c, c->user);
-        }
+        //
+        // Free the MsQuic Connection handle and null it out FIRST, while no
+        // wrapper thread can yet observe closed==true. This guarantees that
+        // once a blocked quic_recv() wakes (below) and its caller proceeds to
+        // quic_close()/delete the quic_conn, this MsQuic worker thread is no
+        // longer touching *c -> no use-after-free. When AppCloseInProgress is
+        // set, quic_close() already closed the handle, so we must not again.
+        //
         if (!Event->SHUTDOWN_COMPLETE.AppCloseInProgress) {
             g_MsQuic->ConnectionClose(Connection);
             c->Connection = nullptr;
+        }
+        if (c->on_closed) {
+            c->on_closed(c, c->user);
+        }
+        {
+            //
+            // Hold mtx across BOTH the state change and notify_all(). A blocked
+            // quic_recv() can only return after re-acquiring mtx inside wait(),
+            // which it cannot do until this scope releases the lock -> by then
+            // notify_all() has finished touching c->cv. Without this, the woken
+            // caller could delete the quic_conn (and its cv) while this thread
+            // were still inside notify_all().
+            //
+            std::lock_guard<std::mutex> lk(c->mtx);
+            c->closed = true;
+            c->cv.notify_all();
         }
         break;
     default:

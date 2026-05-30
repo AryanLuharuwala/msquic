@@ -57,6 +57,38 @@ Abstract:
     wrapper completes the receive synchronously. The (buf, len) handed to
     on_recv is valid only for the duration of that callback.
 
+    ----------------------------------------------------------------------------
+    Receive delivery: on_recv vs quic_recv are MUTUALLY EXCLUSIVE
+    ----------------------------------------------------------------------------
+    Pick ONE receive path per connection. Each received chunk is BOTH appended
+    to the FIFO that quic_recv() drains AND passed to on_recv (if set). If you
+    register an on_recv callback AND also call quic_recv() on the same
+    connection, every chunk is delivered twice (once to each path). Use on_recv
+    for event-driven call sites, or quic_recv() for blocking call sites, but not
+    both on the same connection.
+
+    ----------------------------------------------------------------------------
+    Connection ownership / cleanup (who calls quic_close)
+    ----------------------------------------------------------------------------
+    Every quic_conn must be released with EXACTLY ONE quic_close() call, on both
+    the client and the server side:
+
+      * Client (quic_connect): the caller owns the returned quic_conn and must
+        quic_close() it when done (e.g. after its quic_send/quic_recv work, or
+        after on_closed fires).
+
+      * Server (quic_listen / on_accept): the quic_conn delivered to on_accept
+        is wrapper-allocated, but its OWNERSHIP transfers to whoever consumes it
+        (typically the worker thread started from on_accept). That consumer must
+        quic_close() it exactly once when finished. The wrapper does NOT free
+        accepted connections for you; skipping quic_close() leaks the quic_conn.
+
+    quic_close() is safe to call after the peer has already closed the
+    connection (i.e. after on_closed fired or after quic_recv() returned
+    quic_err_closed): the underlying MsQuic handles are freed at most once and
+    the quic_conn is always freed. It is NOT, however, safe to call quic_close()
+    more than once on the same handle, nor from inside a wrapper callback.
+
 --*/
 
 #ifndef _QUIC_WRAPPER_H_
@@ -99,8 +131,11 @@ typedef enum quic_result {
 //
 //   on_connected : handshake finished, stream is ready for quic_send().
 //   on_recv      : peer sent (buf, len) bytes. Valid only during the call.
+//                  Mutually exclusive with quic_recv(); see the header comment.
 //   on_closed    : the connection (and its stream) are gone. After this fires
-//                  the handle must not be used except for quic_close().
+//                  the handle must not be used except for quic_close(). It does
+//                  NOT free the handle for you: the owner must still call
+//                  quic_close() exactly once (see "Connection ownership").
 //
 typedef void (*quic_on_connected)(quic_conn* conn, void* user);
 typedef void (*quic_on_recv)(quic_conn* conn, const uint8_t* buf, size_t len, void* user);
@@ -181,8 +216,12 @@ void quic_set_callbacks(
     void* user);
 
 //
-// Gracefully shut down and close a connection handle and its stream. Safe to
-// call exactly once per handle. After this the handle is freed.
+// Gracefully shut down and close a connection handle and its stream, and free
+// the handle. Call EXACTLY ONCE per quic_conn (client and server side alike;
+// see "Connection ownership / cleanup" above). Safe to call after the peer has
+// already closed the connection (after on_closed / quic_err_closed) -- the
+// MsQuic handles are freed at most once. Do NOT call it twice, and do NOT call
+// it from inside a wrapper callback.
 //
 void quic_close(quic_conn* conn);
 
