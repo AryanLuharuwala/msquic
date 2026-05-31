@@ -33,6 +33,7 @@ Abstract:
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 
@@ -89,6 +90,16 @@ main(int argc, char** argv)
 {
     const char* certFile = (argc > 1) ? argv[1] : "/tmp/quicwrap.cert";
     const char* keyFile  = (argc > 2) ? argv[2] : "/tmp/quicwrap.key";
+
+    // msquic links a statically-built vendored quictls. If the process loads a
+    // *system* openssl.cnf meant for a different OpenSSL build, the TLS provider
+    // init inside MsQuicOpen2 fails and quic_init() returns QUIC_STATUS_TLS_ERROR
+    // (0x7e). Bypassing the config file avoids that mismatch for this self-
+    // contained demo. Production apps should instead point quictls at its own
+    // openssldir / a compatible OPENSSL_CONF. Only set it if the caller hasn't.
+    if (getenv("OPENSSL_CONF") == NULL) {
+        setenv("OPENSSL_CONF", "/dev/null", 0);
+    }
 
     if (quic_init() != quic_ok) {
         printf("quic_init failed (status 0x%x)\n", quic_last_status());

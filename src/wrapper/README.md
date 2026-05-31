@@ -76,6 +76,14 @@ QUIC always runs over TLS 1.3, so even a loopback demo needs these:
   self-signed cert is accepted. **Local testing only.** Set
   `opts.verify_cert = 1` for production, where the server presents a CA-trusted
   certificate.
+- **`OPENSSL_CONF` / vendored quictls** – msquic statically links its own
+  `quictls` build. If the process loads a *system* `openssl.cnf` written for a
+  different OpenSSL install, the TLS provider init inside `MsQuicOpen2` fails and
+  `quic_init()` returns `QUIC_STATUS_TLS_ERROR` (`0x7e`). The simplest fix for a
+  self-contained run is to bypass the system config: `OPENSSL_CONF=/dev/null`.
+  The bundled `echo` example does this automatically when `OPENSSL_CONF` is
+  unset. Production apps should instead point quictls at its own `openssldir` /
+  a compatible `OPENSSL_CONF`.
 
 ## Buffer ownership
 
@@ -96,10 +104,20 @@ cmake --build build --target quic_wrapper quic_wrapper_echo
 ```
 
 Building msquic itself requires its TLS submodule (`quictls`/OpenSSL) to be
-present and built. On this laptop the full build is deferred — the actual
-build + run of the example is handled by the **rtxserver** step. The wrapper and
-example were validated here with a `-fsyntax-only` header check against the real
-`src/inc/msquic.h`.
+present and built:
+
+```sh
+git submodule update --init --depth 1 submodules/quictls
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DQUIC_TLS_LIB=quictls \
+  -DQUIC_BUILD_TOOLS=OFF -DQUIC_BUILD_TEST=OFF -DQUIC_BUILD_PERF=OFF \
+  -DQUIC_ENABLE_LOGGING=OFF -DQUIC_BUILD_WRAPPER=ON
+cmake --build build -j2 --target quic_wrapper quic_wrapper_echo
+```
+
+This wrapper + `echo` example were built and run end-to-end against a real
+`libmsquic` (gcc 15, vendored quictls): the demo completes a QUIC 1.3 handshake
+and a bidirectional stream echo on `127.0.0.1`. Note GCC 13 can ICE while
+compiling quictls — gcc 15 (or clang) builds it cleanly.
 
 ## Running the loopback echo demo
 
