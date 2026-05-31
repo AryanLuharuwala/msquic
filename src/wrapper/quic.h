@@ -205,6 +205,17 @@ quic_result quic_send(quic_conn* conn, const void* buf, size_t len);
 quic_result quic_recv(quic_conn* conn, void* buf, size_t cap, size_t* out_n);
 
 //
+// BLOCKING receive with a per-call deadline. Identical to quic_recv() except it
+// waits at most timeout_ms milliseconds for data to arrive. Returns:
+//   quic_ok          : *out_n bytes copied (1..cap).
+//   quic_err_closed  : the stream/connection closed with no more data.
+//   quic_err_timeout : no data arrived within timeout_ms (*out_n set to 0).
+//   quic_err         : other failure.
+// timeout_ms < 0 means block forever (identical behavior to quic_recv()).
+//
+quic_result quic_recv_timeout(quic_conn* conn, void* buf, size_t cap, size_t* out_n, int timeout_ms);
+
+//
 // Replace the per-connection callbacks (handy from on_accept on the server
 // side, where the connection is created by the wrapper).
 //

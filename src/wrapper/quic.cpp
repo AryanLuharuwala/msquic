@@ -40,6 +40,7 @@ Abstract:
 #include "quic.h"
 #include "msquic.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <condition_variable>
@@ -483,13 +484,39 @@ quic_result quic_send(quic_conn* conn, const void* buf, size_t len)
 
 quic_result quic_recv(quic_conn* conn, void* buf, size_t cap, size_t* out_n)
 {
+    // Block-forever semantics preserved: delegate to the timed variant with a
+    // negative (infinite) deadline.
+    return quic_recv_timeout(conn, buf, cap, out_n, -1);
+}
+
+quic_result quic_recv_timeout(quic_conn* conn, void* buf, size_t cap, size_t* out_n, int timeout_ms)
+{
     if (conn == nullptr || buf == nullptr || out_n == nullptr) {
         return quic_err;
     }
     *out_n = 0;
 
     std::unique_lock<std::mutex> lk(conn->mtx);
-    conn->cv.wait(lk, [&] { return !conn->rxfifo.empty() || conn->closed; });
+
+    // Predicate: data available OR the stream/conn closed. Holding mtx while the
+    // RECEIVE / SHUTDOWN callbacks mutate rxfifo/closed (and then notify under
+    // the same mutex) means a wakeup cannot be lost between us testing the
+    // predicate and entering the wait -- wait_for re-tests the predicate under
+    // the lock on every wakeup (spurious or real), exactly like wait().
+    const auto pred = [&] { return !conn->rxfifo.empty() || conn->closed; };
+
+    if (timeout_ms < 0) {
+        // Infinite wait: identical to the original quic_recv().
+        conn->cv.wait(lk, pred);
+    } else {
+        // Timed wait. wait_for returns false only if the deadline elapsed AND
+        // the predicate is still false; on every wakeup it re-evaluates pred
+        // under the lock, so a notify racing the timeout is never lost.
+        if (!conn->cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), pred)) {
+            // Deadline elapsed with no data and not closed.
+            return quic_err_timeout;
+        }
+    }
 
     if (conn->rxfifo.empty()) {
         // Closed with nothing buffered.
