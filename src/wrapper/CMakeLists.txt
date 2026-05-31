@@ -40,3 +40,25 @@ endif()
 
 set_property(TARGET quic_wrapper_echo PROPERTY FOLDER "${QUIC_FOLDER_PREFIX}wrapper")
 set_property(TARGET quic_wrapper_echo APPEND PROPERTY BUILD_RPATH "$ORIGIN")
+
+# Multi-connection concurrency stress reproducer (see test/quic_stress.cpp). It
+# stands up K loopback listeners and fires R rounds of C concurrent clients
+# (plain echoes, nested node->node relays, and deliberate send-vs-close races)
+# to exercise the wrapper's per-connection locking under the dlx-style topology.
+# Run it under -fsanitize=thread / -fsanitize=address to police the wrapper's
+# data races (a tsan suppressions file for uninstrumented libmsquic-internal
+# frames lives at test/tsan_suppressions.txt).
+add_executable(quic_wrapper_stress test/quic_stress.cpp)
+target_link_libraries(quic_wrapper_stress quic_wrapper inc msquic logging base_link)
+
+if (BUILD_SHARED_LIBS)
+    target_link_libraries(quic_wrapper_stress msquic_platform)
+endif()
+
+if (NOT WIN32)
+    find_package(Threads REQUIRED)
+    target_link_libraries(quic_wrapper_stress Threads::Threads)
+endif()
+
+set_property(TARGET quic_wrapper_stress PROPERTY FOLDER "${QUIC_FOLDER_PREFIX}wrapper")
+set_property(TARGET quic_wrapper_stress APPEND PROPERTY BUILD_RPATH "$ORIGIN")

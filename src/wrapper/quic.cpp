@@ -53,8 +53,21 @@ Abstract:
 //
 namespace {
 
+//
+// g_MsQuic / g_Registration are created by quic_init() and shared by all
+// handles. They are guarded for INITIALIZATION/TEARDOWN by g_LibMtx with a
+// reference count (g_LibRefs): the library is opened on the 0->1 transition and
+// closed on the 1->0 transition, so concurrent factories can share it and a
+// late teardown cannot null g_MsQuic out from under an in-flight call. Once
+// opened, the pointers are only written again at the final 1->0 teardown, by
+// which point the caller contract requires all handles to be closed; readers in
+// the hot path (quic_send/quic_close/callbacks) therefore observe a stable
+// non-null g_MsQuic without taking g_LibMtx on every access.
+//
 const QUIC_API_TABLE* g_MsQuic = nullptr;
 HQUIC g_Registration = nullptr;
+std::mutex g_LibMtx;
+int g_LibRefs = 0;
 
 thread_local uint32_t t_LastStatus = QUIC_STATUS_SUCCESS;
 
@@ -95,6 +108,7 @@ struct quic_conn {
     bool connected = false;
     bool stream_ready = false;
     bool closed = false;         // peer/stream/conn shut down: no more data
+    bool app_closing = false;    // quic_close() has begun tearing this conn down
 };
 
 struct quic_listener {
@@ -112,6 +126,9 @@ _Function_class_(QUIC_STREAM_CALLBACK)
 static QUIC_STATUS QUIC_API
 StreamCallback(HQUIC Stream, void* Context, QUIC_STREAM_EVENT* Event)
 {
+    // The stream handle is reached via c->Stream (claimed under conn->mtx in the
+    // SHUTDOWN_COMPLETE case); the Stream parameter is otherwise unused.
+    (void)Stream;
     auto* c = (quic_conn*)Context;
     switch (Event->Type) {
     case QUIC_STREAM_EVENT_RECEIVE: {
@@ -154,9 +171,34 @@ StreamCallback(HQUIC Stream, void* Context, QUIC_STREAM_EVENT* Event)
         c->cv.notify_all();
         break;
     case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
-        if (!Event->SHUTDOWN_COMPLETE.AppCloseInProgress) {
-            g_MsQuic->StreamClose(Stream);
-            c->Stream = nullptr;
+        //
+        // Every StreamOpen()'d / adopted stream handle MUST be StreamClose()'d
+        // exactly once -- ConnectionClose() does NOT free app-held stream handles
+        // (skipping the close here would leak the stream and hang
+        // RegistrationClose()). So, unlike the connection handler, we do NOT gate
+        // on AppCloseInProgress / app_closing: quic_close() deliberately does NOT
+        // close the stream itself (it only requests a graceful StreamShutdown()),
+        // it leaves the StreamClose() to this terminal SHUTDOWN_COMPLETE. The
+        // c->Stream claim under conn->mtx is what makes it exactly once and
+        // race-free: whoever observes c->Stream non-null nulls it and is the sole
+        // closer. Nulling under the lock also mutually excludes a concurrent
+        // quic_send() (which holds conn->mtx across its StreamSend): that send
+        // either ran on a still-valid handle before us, or observes nullptr and
+        // returns quic_err_closed -- never a StreamSend on a handle we are
+        // closing. StreamClose() runs after the lock is dropped.
+        //
+        {
+            HQUIC toClose = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(c->mtx);
+                if (c->Stream != nullptr) {
+                    toClose = c->Stream;
+                    c->Stream = nullptr;
+                }
+            }
+            if (toClose != nullptr) {
+                g_MsQuic->StreamClose(toClose);
+            }
         }
         break;
     default:
@@ -188,28 +230,56 @@ ConnectionCallback(HQUIC Connection, void* Context, QUIC_CONNECTION_EVENT* Event
     case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED:
         //
         // Server side: the client opened the bidi stream. Adopt it and wire the
-        // stream callback. MUST set the handler before returning.
+        // stream callback. The callback handler MUST be set before the stream
+        // can fire events (and before any other thread can observe the handle),
+        // so set it on the local Event handle first, then publish the handle
+        // into c->Stream UNDER conn->mtx together with stream_ready -- so a
+        // quic_send/quic_close racing this adoption sees a consistent (handle,
+        // ready) pair rather than a torn write.
         //
-        c->Stream = Event->PEER_STREAM_STARTED.Stream;
-        g_MsQuic->SetCallbackHandler(c->Stream, (void*)StreamCallback, c);
         {
-            std::lock_guard<std::mutex> lk(c->mtx);
-            c->stream_ready = true;
+            HQUIC stream = Event->PEER_STREAM_STARTED.Stream;
+            g_MsQuic->SetCallbackHandler(stream, (void*)StreamCallback, c);
+            {
+                std::lock_guard<std::mutex> lk(c->mtx);
+                c->Stream = stream;
+                c->stream_ready = true;
+            }
+            c->cv.notify_all();
         }
-        c->cv.notify_all();
         break;
     case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
         //
-        // Free the MsQuic Connection handle and null it out FIRST, while no
-        // wrapper thread can yet observe closed==true. This guarantees that
-        // once a blocked quic_recv() wakes (below) and its caller proceeds to
-        // quic_close()/delete the quic_conn, this MsQuic worker thread is no
-        // longer touching *c -> no use-after-free. When AppCloseInProgress is
-        // set, quic_close() already closed the handle, so we must not again.
+        // Close the MsQuic Connection handle and null it out FIRST, while no
+        // wrapper thread can yet observe closed==true (and BEFORE on_closed
+        // fires, since on_closed is itself a signal that releases the owner to
+        // quic_close()). This guarantees that once a blocked quic_recv() wakes
+        // (below) and its caller proceeds to quic_close()/delete the quic_conn,
+        // this MsQuic worker thread is no longer touching the Connection handle
+        // -> no use-after-free.
         //
-        if (!Event->SHUTDOWN_COMPLETE.AppCloseInProgress) {
-            g_MsQuic->ConnectionClose(Connection);
-            c->Connection = nullptr;
+        // We must NOT close the handle here if quic_close() owns the teardown,
+        // or we double-close (MsQuic asserts !HandleClosed and bugchecks). Two
+        // overlapping guards make that decision race-free:
+        //   * Event->SHUTDOWN_COMPLETE.AppCloseInProgress -- MsQuic's flag, TRUE
+        //     for any event delivered while the app's ConnectionClose() runs.
+        //   * c->app_closing -- OUR flag, set under conn->mtx by quic_close() the
+        //     instant it begins, BEFORE its ConnectionShutdown(). It closes the
+        //     window where the graceful ConnectionShutdown() issued by
+        //     quic_close() delivers a SHUTDOWN_COMPLETE with AppCloseInProgress
+        //     still FALSE (ConnectionClose() not yet entered) -- without this
+        //     flag we would close the handle and then quic_close() would close it
+        //     again. Reading the flag + nulling c->Connection UNDER conn->mtx
+        //     synchronizes us with quic_close() (no torn access). Holding the
+        //     lock across ConnectionClose() is safe: terminal event (no
+        //     re-entry); a concurrent quic_close() serializes and sees nullptr.
+        //
+        {
+            std::lock_guard<std::mutex> lk(c->mtx);
+            if (!Event->SHUTDOWN_COMPLETE.AppCloseInProgress && !c->app_closing) {
+                g_MsQuic->ConnectionClose(Connection);
+                c->Connection = nullptr;
+            }
         }
         if (c->on_closed) {
             c->on_closed(c, c->user);
@@ -347,11 +417,21 @@ extern "C" {
 
 quic_result quic_init(void)
 {
-    if (g_MsQuic != nullptr) {
+    //
+    // Thread-safe + reference-counted. Concurrent callers serialize on g_LibMtx;
+    // the underlying MsQuic + Registration are opened only on the 0->1 ref
+    // transition. Already-initialized callers just bump the count and return
+    // quic_ok (preserving the documented "returns quic_ok when already
+    // initialized" behavior).
+    //
+    std::lock_guard<std::mutex> lk(g_LibMtx);
+    if (g_LibRefs > 0) {
+        ++g_LibRefs;
         return quic_ok; // already initialized
     }
+
     QUIC_STATUS status = MsQuicOpen2(&g_MsQuic);
-    if (QUIC_FAILED(status)) { SetLastStatus(status); return quic_err; }
+    if (QUIC_FAILED(status)) { SetLastStatus(status); g_MsQuic = nullptr; return quic_err; }
 
     const QUIC_REGISTRATION_CONFIG regConfig =
         { "quic_wrapper", QUIC_EXECUTION_PROFILE_LOW_LATENCY };
@@ -360,23 +440,39 @@ quic_result quic_init(void)
         SetLastStatus(status);
         MsQuicClose(g_MsQuic);
         g_MsQuic = nullptr;
+        g_Registration = nullptr;
         return quic_err;
     }
+    g_LibRefs = 1;
     return quic_ok;
 }
 
 void quic_cleanup(void)
 {
-    if (g_MsQuic == nullptr) {
-        return;
+    //
+    // Reference-counted teardown: only the LAST matching quic_cleanup() (the
+    // 1->0 transition) actually closes MsQuic. Earlier calls just drop a ref.
+    // Idempotent: extra calls with refs already at 0 are a no-op. The actual
+    // close still happens under g_LibMtx; RegistrationClose() blocks until all
+    // child connections/streams are closed, so by the time we null g_MsQuic no
+    // wrapper callback can still be running against it.
+    //
+    std::lock_guard<std::mutex> lk(g_LibMtx);
+    if (g_LibRefs == 0) {
+        return; // not initialized / already torn down
+    }
+    if (--g_LibRefs > 0) {
+        return; // still in use by another initializer
     }
     if (g_Registration != nullptr) {
         // Blocks until all child objects (connections/streams) are closed.
         g_MsQuic->RegistrationClose(g_Registration);
         g_Registration = nullptr;
     }
-    MsQuicClose(g_MsQuic);
-    g_MsQuic = nullptr;
+    if (g_MsQuic != nullptr) {
+        MsQuicClose(g_MsQuic);
+        g_MsQuic = nullptr;
+    }
 }
 
 void quic_set_callbacks(
@@ -451,17 +547,9 @@ quic_result quic_send(quic_conn* conn, const void* buf, size_t len)
         return quic_err;
     }
 
-    // Wait until the stream is usable (handshake done / stream adopted).
-    {
-        std::unique_lock<std::mutex> lk(conn->mtx);
-        conn->cv.wait(lk, [&] { return conn->stream_ready || conn->closed; });
-        if (conn->closed || conn->Stream == nullptr) {
-            return quic_err_closed;
-        }
-    }
-
     // Allocate one block holding the QUIC_BUFFER header + payload. MsQuic owns
-    // it until SEND_COMPLETE, where StreamCallback frees it.
+    // it until SEND_COMPLETE, where StreamCallback frees it. We allocate BEFORE
+    // taking the lock so the memcpy/malloc happen outside the critical section.
     void* raw = malloc(sizeof(QUIC_BUFFER) + len);
     if (raw == nullptr) {
         SetLastStatus(QUIC_STATUS_OUT_OF_MEMORY);
@@ -471,6 +559,25 @@ quic_result quic_send(quic_conn* conn, const void* buf, size_t len)
     sb->Buffer = (uint8_t*)raw + sizeof(QUIC_BUFFER);
     sb->Length = (uint32_t)len;
     memcpy(sb->Buffer, buf, len);
+
+    //
+    // Hold conn->mtx across BOTH the readiness wait AND the StreamSend, so the
+    // Stream handle we read cannot be closed + nulled by StreamCallback's
+    // SHUTDOWN_COMPLETE (which also takes conn->mtx) between our check and the
+    // send. StreamSend only QUEUES the data (see msquic docs/api/StreamSend.md:
+    // "Queues app data to be sent") and returns; it does NOT invoke stream
+    // callbacks inline on this thread, so holding the per-conn mutex across it
+    // cannot deadlock with the RECEIVE/SHUTDOWN callbacks that also take it --
+    // those run on MsQuic worker threads and simply serialize behind us.
+    //
+    std::unique_lock<std::mutex> lk(conn->mtx);
+    conn->cv.wait(lk, [&] { return conn->stream_ready || conn->closed || conn->app_closing; });
+    if (conn->closed || conn->app_closing || conn->Stream == nullptr) {
+        // Closed, being torn down by quic_close(), or the stream is already gone:
+        // do not StreamSend a closing/stale handle.
+        free(raw);
+        return quic_err_closed;
+    }
 
     QUIC_STATUS status =
         g_MsQuic->StreamSend(conn->Stream, sb, 1, QUIC_SEND_FLAG_NONE, /*ctx*/ raw);
@@ -539,17 +646,59 @@ void quic_close(quic_conn* conn)
         return;
     }
     if (g_MsQuic != nullptr) {
-        if (conn->Stream != nullptr) {
-            g_MsQuic->StreamShutdown(conn->Stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+        //
+        // Set app_closing and SNAPSHOT the Stream/Connection/Configuration
+        // handles, nulling the shared fields, all UNDER conn->mtx; then operate
+        // on the local snapshots OUTSIDE the lock. This is the "claim" half of
+        // the close-exactly-once discipline shared with the worker-thread
+        // SHUTDOWN_COMPLETE callbacks:
+        //   * app_closing tells those callbacks "quic_close() owns the teardown,
+        //     do not close the handles yourself" -- it is set BEFORE we issue any
+        //     Shutdown(), so even the SHUTDOWN_COMPLETE produced by our own
+        //     graceful Stream/Connection Shutdown() (which can carry
+        //     AppCloseInProgress==FALSE) will skip closing. This is what prevents
+        //     the double-close that MsQuic bugchecks on.
+        //   * Nulling the fields coordinates with the OTHER direction: if a
+        //     peer/idle-initiated SHUTDOWN_COMPLETE already closed+nulled a handle
+        //     before us, our snapshot is nullptr and we skip -- so the
+        //     connection is closed exactly once.
+        //
+        // We CLAIM the stream too (null it under the lock) and StreamShutdown()
+        // + StreamClose() it ourselves. ConnectionClose() does NOT free app-held
+        // stream handles, so the stream must be StreamClose()'d exactly once;
+        // claiming it makes quic_close() the sole closer and excludes the stream
+        // SHUTDOWN_COMPLETE handler (which, observing c->Stream == nullptr, skips)
+        // -- otherwise quic_close()'s StreamShutdown() could race a concurrent
+        // worker StreamClose() of the same handle. A graceful StreamShutdown()
+        // before StreamClose() lets the peer receive any final queued bytes.
+        //
+        // We must NOT hold conn->mtx across the Shutdown/Close calls:
+        // ConnectionClose() can deliver SHUTDOWN_COMPLETE synchronously on THIS
+        // thread, and those handlers take conn->mtx -- holding it would
+        // self-deadlock. The connection's inline SHUTDOWN_COMPLETE sees
+        // app_closing/null and skips its close; the stream's sees the nulled
+        // c->Stream and skips its StreamClose().
+        //
+        HQUIC stream = nullptr;
+        HQUIC connection = nullptr;
+        HQUIC configuration = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(conn->mtx);
+            conn->app_closing = true;
+            stream = conn->Stream;             conn->Stream = nullptr;
+            connection = conn->Connection;     conn->Connection = nullptr;
+            configuration = conn->Configuration; conn->Configuration = nullptr;
         }
-        if (conn->Connection != nullptr) {
-            g_MsQuic->ConnectionShutdown(conn->Connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
-            g_MsQuic->ConnectionClose(conn->Connection);
-            conn->Connection = nullptr;
+        if (stream != nullptr) {
+            g_MsQuic->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+            g_MsQuic->StreamClose(stream);
         }
-        if (conn->Configuration != nullptr) {
-            g_MsQuic->ConfigurationClose(conn->Configuration);
-            conn->Configuration = nullptr;
+        if (connection != nullptr) {
+            g_MsQuic->ConnectionShutdown(connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+            g_MsQuic->ConnectionClose(connection);
+        }
+        if (configuration != nullptr) {
+            g_MsQuic->ConfigurationClose(configuration);
         }
     }
     delete conn;
